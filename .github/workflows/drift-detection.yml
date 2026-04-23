@@ -1,0 +1,123 @@
+name: Drift Detection
+
+on:
+  workflow_dispatch:        # manual trigger only — run from Actions tab
+  # To enable scheduled drift detection, uncomment the block below.
+  # This runs a full Terragrunt plan against live AWS and opens a GitHub
+  # issue if any resource has drifted from the Terraform state.
+  #
+  # schedule:
+  #   - cron: "0 6 * * *"   # daily at 06:00 UTC
+  #
+  # Scheduling considerations:
+  #   - Each run downloads providers and runs a full plan for every module
+  #     in every environment — budget ~5 minutes per environment
+  #   - For busy teams, consider limiting to prod only by removing dev from
+  #     the matrix, or switching to weekly (cron: "0 6 * * 1")
+  #   - Scheduled runs do not have access to environment secrets by default
+  #     in GitHub; ensure AWS_ROLE_ARN is set as a repository-level secret
+  #     (not environment-scoped) if you enable scheduling
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write             # to open a GitHub issue when drift is found
+
+env:
+  TF_VERSION: "1.7.0"
+  TG_VERSION: "0.55.0"
+  AWS_REGION: "us-east-1"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  detect-drift:
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [dev, prod]
+
+    runs-on: ubuntu-latest
+    environment: ${{ matrix.environment }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Setup Terragrunt
+        run: |
+          curl -sL "https://github.com/gruntwork-io/terragrunt/releases/download/v${{ env.TG_VERSION }}/terragrunt_linux_amd64" \
+            -o /usr/local/bin/terragrunt
+          chmod +x /usr/local/bin/terragrunt
+
+      - name: Package Lambda
+        run: |
+          mkdir -p lambda
+          zip -j lambda/handler.zip lambda/index.py
+
+      - name: Run plan to detect drift
+        id: drift
+        working-directory: terragrunt/environments/${{ matrix.environment }}
+        run: |
+          set +e
+          OUTPUT=$(terragrunt run-all plan --terragrunt-non-interactive -detailed-exitcode 2>&1)
+          EXIT_CODE=$?
+          echo "$OUTPUT" > /tmp/drift_output.txt
+          # exit code 2 means there are changes (drift detected)
+          if [ $EXIT_CODE -eq 2 ]; then
+            echo "drifted=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "drifted=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open GitHub issue on drift
+        if: steps.drift.outputs.drifted == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const output = fs.readFileSync('/tmp/drift_output.txt', 'utf8');
+            const truncated = output.length > 60000 ? output.slice(-60000) + '\n...(truncated)' : output;
+
+            // Check if a drift issue is already open for this environment
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: ['drift', '${{ matrix.environment }}'],
+            });
+
+            if (issues.data.length > 0) {
+              // Add a comment to the existing issue instead of opening a duplicate
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issues.data[0].number,
+                body: `## Drift still detected — ${new Date().toISOString()}\n\`\`\`hcl\n${truncated}\n\`\`\``,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `[Drift] Infrastructure drift detected in \`${{ matrix.environment }}\``,
+                body: `## Infrastructure drift detected\n\nThe daily drift detection run found that live AWS resources no longer match the Terraform state in \`${{ matrix.environment }}\`.\n\nRun the **Apply** workflow or investigate manually.\n\n### Plan output\n\`\`\`hcl\n${truncated}\n\`\`\``,
+                labels: ['drift', '${{ matrix.environment }}'],
+              });
+            }
+
+      - name: Fail job if drift found
+        if: steps.drift.outputs.drifted == 'true'
+        run: |
+          echo "Drift detected in ${{ matrix.environment }} — see the GitHub issue for details."
+          exit 1

@@ -1,0 +1,6 @@
+aws_region             = "us-east-1"
+github_org             = "krishph"
+github_repo            = "terragrunt-aws-secure-starter"
+role_name              = "github-actions-deploy-role"
+terraform_state_bucket = "terraform-state-bucket"
+terraform_lock_table   = "terraform-state-lock"

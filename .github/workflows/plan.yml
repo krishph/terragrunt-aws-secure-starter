@@ -1,0 +1,160 @@
+name: Plan
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - prod
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  TF_VERSION: "1.7.0"
+  TG_VERSION: "0.55.0"
+  AWS_REGION: "us-east-1"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  set-env:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.env.outputs.environment }}
+    steps:
+      - id: env
+        run: echo "environment=${{ inputs.environment }}" >> "$GITHUB_OUTPUT"
+
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Checkov
+        id: checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: terraform/modules
+          config_file: .checkov.yaml
+          output_format: cli
+          soft_fail: false
+
+  plan:
+    needs: [set-env, security-scan]
+    runs-on: ubuntu-latest
+    environment: ${{ needs.set-env.outputs.environment }}
+    env:
+      ENVIRONMENT: ${{ needs.set-env.outputs.environment }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Setup Terragrunt
+        run: |
+          curl -sL "https://github.com/gruntwork-io/terragrunt/releases/download/v${{ env.TG_VERSION }}/terragrunt_linux_amd64" \
+            -o /usr/local/bin/terragrunt
+          chmod +x /usr/local/bin/terragrunt
+
+      - name: Package Lambda
+        run: |
+          mkdir -p lambda
+          zip -j lambda/handler.zip lambda/index.py
+
+      - name: Terragrunt Plan
+        id: plan
+        continue-on-error: true
+        working-directory: terragrunt/environments/${{ env.ENVIRONMENT }}
+        run: |
+          touch /tmp/plan_output.txt
+          terragrunt run-all plan --terragrunt-non-interactive 2>&1 | tee /tmp/plan_output.txt
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Post plan as PR comment
+        uses: actions/github-script@v7
+        if: always() && github.event_name == 'pull_request'
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.existsSync('/tmp/plan_output.txt')
+              ? fs.readFileSync('/tmp/plan_output.txt', 'utf8')
+              : '(no plan output — plan step failed before producing output)';
+            const truncated = plan.length > 60000 ? plan.slice(-60000) + '\n...(truncated)' : plan;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## Terraform Plan — \`${{ env.ENVIRONMENT }}\`\n\`\`\`hcl\n${truncated}\n\`\`\``
+            });
+
+  cost-estimate:
+    needs: set-env
+    runs-on: ubuntu-latest
+    env:
+      ENVIRONMENT: ${{ needs.set-env.outputs.environment }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Infracost
+        uses: infracost/actions/setup@v3
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: Generate Infracost breakdown
+        run: |
+          infracost breakdown \
+            --path terragrunt/environments/${{ env.ENVIRONMENT }} \
+            --terraform-var-file terragrunt/environments/${{ env.ENVIRONMENT }}/env.hcl \
+            --format json \
+            --out-file /tmp/infracost.json
+
+      - name: Post cost estimate
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          script: |
+            const fs = require('fs');
+            const data = JSON.parse(fs.readFileSync('/tmp/infracost.json', 'utf8'));
+            const cost = data.totalMonthlyCost ?? 'N/A';
+            const currency = data.currency ?? 'USD';
+            const body = `## Infracost Cost Estimate — \`${{ env.ENVIRONMENT }}\`\n**Estimated monthly cost: ${cost} ${currency}**\n\nRun \`infracost breakdown\` locally for a full breakdown.`;
+
+            // Always write to job summary (visible in every workflow run)
+            await core.summary.addRaw(body).write();
+
+            // Also post as PR comment when triggered from a pull request
+            if (context.eventName === 'pull_request') {
+              const comments = await github.rest.issues.listComments({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+              });
+              const existing = comments.data.find(c => c.body.startsWith('## Infracost Cost Estimate'));
+              if (existing) {
+                await github.rest.issues.updateComment({ owner: context.repo.owner, repo: context.repo.repo, comment_id: existing.id, body });
+              } else {
+                await github.rest.issues.createComment({ issue_number: context.issue.number, owner: context.repo.owner, repo: context.repo.repo, body });
+              }
+            }

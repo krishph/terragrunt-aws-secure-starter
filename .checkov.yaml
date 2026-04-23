@@ -1,0 +1,24 @@
+# Suppress checks that are noisy for this project's intentional design choices
+skip-check:
+  - CKV_AWS_116   # Lambda DLQ — not needed for sync API use case
+  - CKV_AWS_117   # Lambda inside VPC — already enforced in the module
+  - CKV_AWS_272   # Lambda code signing — out of scope for this demo
+  - CKV2_AWS_5    # SG not attached — SG is attached via Terragrunt dependency
+  - CKV_AWS_76    # API GW access logging — add in production, skipped for demo clarity
+  - CKV_AWS_59    # Public API methods — intentional; URL shortener requires unauthenticated access
+  - CKV_AWS_120   # API Gateway caching — adds per-GB cost, not needed for demo
+  - CKV2_AWS_51   # API Gateway client certificates — client-side complexity out of scope
+  - CKV2_AWS_53   # API Gateway request validation — proxy integration; validation handled in Lambda
+  - CKV2_AWS_29   # WAF for public API — overkill for demo
+  - CKV_AWS_158   # CloudWatch log group KMS — overkill for demo
+  - CKV_AWS_173   # Lambda env var KMS — overkill for demo
+  - CKV_AWS_115   # Lambda concurrent execution limit — acceptable default for demo
+  - CKV2_AWS_62   # S3 event notifications — not applicable for URL store use case
+  - CKV2_AWS_61   # S3 lifecycle configuration — not needed for demo
+  - CKV_AWS_144   # S3 cross-region replication — overkill for demo
+  - CKV_AWS_145   # S3 KMS encryption — already AES256; KMS overkill for demo
+  - CKV_AWS_18    # S3 access logging — adds storage cost and complexity for demo
+
+soft-fail: false
+compact: true
+output: cli
